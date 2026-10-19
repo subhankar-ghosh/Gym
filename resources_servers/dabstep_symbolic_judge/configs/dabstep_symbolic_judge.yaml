@@ -1,0 +1,8 @@
+dabstep_symbolic_judge:
+  resources_servers:
+    dabstep_symbolic_judge:
+      entrypoint: app.py
+      domain: agent
+      verified: true
+      description: DABStep questions graded by deterministic symbolic/numeric answer matching against real ground truth
+      value: SFT/eval training data for DABStep OpenCode/Gym rollouts

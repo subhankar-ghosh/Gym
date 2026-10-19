@@ -532,7 +532,7 @@ class GdpPdfAgent(SimpleAgent):
                 params_dict["input"] = [{"role": "user", "content": content}]
                 params = NeMoGymResponseCreateParamsNonStreaming.model_validate(params_dict)
                 try:
-                    model_response, trajectory, _, cookies = await self._create_episode(
+                    model_response, trajectory, _, cookies, _ = await self._create_episode(
                         params,
                         model_url_path=model_url_path,
                         resources_server_cookies=cookies,
@@ -580,7 +580,7 @@ class GdpPdfAgent(SimpleAgent):
                         continue
                     break
         else:
-            model_response, trajectory, _, cookies = await self._create_episode(
+            model_response, trajectory, _, cookies, _ = await self._create_episode(
                 body.responses_create_params,
                 model_url_path=model_url_path,
                 resources_server_cookies=cookies,

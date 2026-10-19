@@ -59,11 +59,13 @@ from nemo_gym.rollout_observability import (
 from nemo_gym.server_utils import get_response_json, is_nemo_gym_fastapi_entrypoint, raise_for_status
 from nemo_gym.server_utils import request as http_request
 from nemo_gym.tool_access import DirectHTTPToolAccess, MCPToolAccess
+from responses_api_agents.simple_agent.truncation import TruncationMonitor
 
 
 LOG = logging.getLogger(__name__)
 
 _INTERNAL_TRAJECTORY_KEY = "_ng_trajectory"
+_INTERNAL_TRUNCATION_KEY = "_ng_truncation"
 
 
 @dataclass
@@ -85,6 +87,20 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
             "requests, where unresolved function calls are returned to the Environment Server."
         ),
     )
+    # LOCAL PATCH: rollout truncation. Off by default (matches upstream); environment
+    # configs that need it (e.g. dabstep_rl) set the limits explicitly.
+    repetition_abort_threshold: int | None = None
+    repetition_abort_mode: str = "consecutive"
+    wall_clock_abort_seconds: float | None = None
+
+    def model_post_init(self, context: Any, /) -> None:
+        super().model_post_init(context)
+        # Print once at startup so a missing limit is visible in the first log lines.
+        print(
+            f"[simple_agent] truncation: repetition_abort_threshold={self.repetition_abort_threshold} "
+            f"({self.repetition_abort_mode}), wall_clock_abort_seconds={self.wall_clock_abort_seconds}",
+            flush=True,
+        )
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -144,7 +160,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         task_id: str = "unscoped",
         rollout_id: str = "unscoped",
         collect_trajectory: bool = False,
-    ) -> tuple[NeMoGymResponse, TrajectoryRecord | None, Any, Any]:
+    ) -> tuple[NeMoGymResponse, TrajectoryRecord | None, Any, Any, dict | None]:
         tool_records: list[TrajectoryToolCall] = []
         model_calls: list[ModelCallRef] = []
         turns: list[TrajectoryTurn] = []
@@ -159,6 +175,11 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         step = 0
         invocation_status = "completed"
         model_server_cookies = None
+        monitor = TruncationMonitor(
+            repetition_threshold=self.config.repetition_abort_threshold,
+            repetition_mode=self.config.repetition_abort_mode,
+            wall_clock_seconds=self.config.wall_clock_abort_seconds,
+        )
 
         while True:
             step += 1
@@ -328,9 +349,15 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         output=tool_output,
                     )
                 )
+                monitor.observe(output_function_call.name, output_function_call.arguments)
 
             if collect_trajectory and all_fn_calls:
                 turns[-1].step_count = len(tool_records)
+
+            # Abort a looping or over-long rollout; the row is clamped, never dropped.
+            if monitor.record is not None or monitor.check_wall_clock() is not None:
+                invocation_status = "incomplete"
+                break
 
             # Check if max steps is not None and if we have exhausted it.
             if self.config.max_steps and step >= self.config.max_steps:
@@ -355,7 +382,13 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 tool_calls=tool_records,
                 gaps=trajectory_gaps,
             )
-        return model_response, trajectory, model_server_cookies, resources_server_cookies
+        return (
+            model_response,
+            trajectory,
+            model_server_cookies,
+            resources_server_cookies,
+            monitor.record,
+        )
 
     async def responses(
         self,
@@ -382,7 +415,13 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             state.activations += 1
             if state.activations > 1:
                 invocation_id = f"activation-{state.activations}"
-        model_response, trajectory, model_server_cookies, resources_server_cookies = await self._create_episode(
+        (
+            model_response,
+            trajectory,
+            model_server_cookies,
+            resources_server_cookies,
+            truncation,
+        ) = await self._create_episode(
             body,
             model_url_path=self.url_path_for_request("/v1/responses", request),
             resources_server_cookies=state.resources_cookies if state is not None else request.cookies,
@@ -411,10 +450,13 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             downstream_cookies = (model_server_cookies or {}).items()
         for k, v in downstream_cookies:
             response.set_cookie(k, v)
+        updates: dict[str, Any] = {}
         if trajectory is not None:
-            model_response = model_response.model_copy(
-                update={_INTERNAL_TRAJECTORY_KEY: trajectory.model_dump(mode="json")}
-            )
+            updates[_INTERNAL_TRAJECTORY_KEY] = trajectory.model_dump(mode="json")
+        if truncation is not None:
+            updates[_INTERNAL_TRUNCATION_KEY] = truncation
+        if updates:
+            model_response = model_response.model_copy(update=updates)
         return model_response
 
     async def run(self, request: Request, body: SimpleAgentRunRequest) -> SimpleAgentVerifyResponse:
@@ -444,6 +486,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         )
         await raise_for_status(response)
         model_response_json = await get_response_json(response)
+        truncation = model_response_json.pop(_INTERNAL_TRUNCATION_KEY, None)
         cookies = response.cookies
 
         trajectory = None
@@ -490,6 +533,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             )
             await raise_for_status(verify_response)
             result = await get_response_json(verify_response)
+        if truncation is not None:
+            result[_INTERNAL_TRUNCATION_KEY] = truncation
         if trajectory is not None:
             resolved = result.get("resolved")
             if isinstance(resolved, bool) and trajectory.turns:

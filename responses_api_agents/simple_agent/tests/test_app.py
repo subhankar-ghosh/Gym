@@ -1156,7 +1156,7 @@ class TestApp:
         }
         server_client.post = AsyncMock(return_value=_mock_response(payload))
 
-        response, trajectory, _, _ = await server._create_episode(
+        response, trajectory, _, _, _ = await server._create_episode(
             NeMoGymResponseCreateParamsNonStreaming(input="question"),
             model_url_path="/v1/responses",
             rollout_id="reasoning-rollout",

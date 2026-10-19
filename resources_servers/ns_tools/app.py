@@ -74,6 +74,10 @@ class NSToolsConfig(BaseResourcesServerConfig):
     # Per-tool overrides for nemo_skills tools
     nemo_skills_tool_overrides: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
+    # LOCAL PATCH: alias -> real tool name, so the model can be shown a different tool name
+    # than nemo_skills registers. See .tmp/rl_setup_status.md S3.18 (SFT prior expects `python`).
+    tool_name_aliases: Dict[str, str] = Field(default_factory=dict)
+
     # Sandbox configuration for code execution tools
     sandbox_host: str = "127.0.0.1"
     sandbox_port: str = "6000"
@@ -292,6 +296,13 @@ class NSToolsResourcesServer(SimpleResourcesServer):
             tools = await self.tool_manager.list_all_tools()
             for tool in tools:
                 self._tool_name_map[tool["name"]] = tool["name"]
+            for alias, real in (self.config.tool_name_aliases or {}).items():
+                if real not in self._tool_name_map:
+                    raise ValueError(
+                        f"tool_name_aliases maps {alias!r} -> {real!r}, which is not a loaded "
+                        f"nemo_skills tool. Loaded: {list(self._tool_name_map.keys())}"
+                    )
+                self._tool_name_map[alias] = real
             logger.info(f"Loaded {len(tools)} nemo_skills tools: {list(self._tool_name_map.keys())}")
 
         asyncio.get_event_loop().run_until_complete(_load_tools())
@@ -332,7 +343,7 @@ class NSToolsResourcesServer(SimpleResourcesServer):
 
             # Execute the tool
             result = await self.tool_manager.execute_tool(
-                raw_name=tool_name,
+                raw_name=self._tool_name_map[tool_name],
                 args=body,
                 extra_args={"request_id": session_id},
             )

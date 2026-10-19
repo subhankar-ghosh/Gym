@@ -1,0 +1,121 @@
+# DABStep GRPO RL environment.
+#
+# Harness: simple_agent + ns_tools (NeMo-Skills sandbox backend, stateful python).
+# NOT OpenCode/OpenSandbox.
+#
+# The sandbox is launched by ray.sub via SANDBOX_CONTAINER; the data files are mounted
+# read-only into it via ray.sub MOUNTS at:
+#   /dabstep-worlds/data   <- generations/dabstep-worlds/data   (75 worlds, 12 G)
+#   /dabstep/context       <- generations/kaggle/dabstep_context (7 files)
+# Prompt file paths are built against those container-side paths by
+# kaggle/preprocessing/build_dabstep_rl_dataset.py. If the mounts are missing the model
+# does NOT crash -- it answers \boxed{Not Applicable} at scale. Always assert a rollout
+# actually read payments.csv / fees.json before trusting a run.
+
+# CONFIG SHAPE -- ONE TOP-LEVEL KEY PER SERVER INSTANCE. Do not nest several servers under one.
+# `GlobalConfigDictParser.filter_for_server_instance_configs` (nemo_gym/global_config.py:421)
+# iterates the TOP-LEVEL keys and calls maybe_get_server_instance_config(name=<top-level key>),
+# so each top-level key yields exactly ONE server instance named by that key.
+# This file previously put both resources_servers AND the agent under a single `dabstep_rl_env`
+# key; only the agent registered, and the run died (job 3937906) with:
+#   ServerRefNotFoundError: In server instance 'dabstep_rl_env', field 'resources_server'
+#   references resources_servers/'ns_tools', which is not defined in the merged config.
+#   Available resources_servers: (none)
+# Canonical reference: environments/abstention/config.yaml, which uses a separate top-level key
+# per server (`abstention:` for the resources server, `abstention_simple_agent:` for the agent).
+
+# Strict verifier (verbatim port of the real NeMo-Skills DABStep evaluator).
+dabstep_rl:
+  resources_servers:
+    dabstep_rl:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: DABStep GRPO reward -- strict symbolic match against consensus pseudo-labels
+
+# Tool provider. Delegates /verify to dabstep_rl.
+ns_tools:
+  resources_servers:
+    ns_tools:
+      entrypoint: app.py
+      default_verifier: dabstep_rl
+      verifiers:
+        dabstep_rl:
+          type: resources_servers
+          name: dabstep_rl
+      nemo_skills_tools:
+        - nemo_skills.mcp.servers.python_tool::DirectPythonTool
+      nemo_skills_tool_overrides:
+        DirectPythonTool:
+          # Config default is 10s, which is far too short for pandas over a 138k-row
+          # payments.csv. The older NeMo-Skills solution pipeline used 120.
+          exec_timeout_s: 120
+      # Model sees `python`: step_3510's SFT data uses that name in 100% of rows and carries no
+      # system message, so the tool-definition block is its only exposure. See status S3.18.
+      tool_name_aliases:
+        python: stateful_python_code_exec
+      sandbox_host: ${oc.env:NEMO_SKILLS_SANDBOX_HOST,127.0.0.1}
+      sandbox_port: ${oc.env:NEMO_SKILLS_SANDBOX_PORT,6000}
+      disable_session_restore: true
+      domain: agent
+      verified: false
+      description: NeMo Skills stateful python tool execution for DABStep RL
+
+# This top-level key IS the agent instance name, and every dataset row's `agent_ref.name` must
+# equal it. Gym's _validate_agent_names (rollout_collection.py:1754) builds its `available` set
+# from top-level keys containing a `responses_api_agents` block, NOT from the inner key -- rows
+# naming the inner key "simple_agent" matched nothing and every rollout failed (job 3939985).
+# Name follows the in-tree convention (environments/abstention -> `abstention_simple_agent`):
+# <env>_<agent-type>, so it stays unique if a second agent is ever added.
+# Kept in sync with AGENT_INSTANCE_NAME in kaggle/preprocessing/build_dabstep_rl_dataset.py.
+dabstep_rl_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      # S3.22: 39.8% of v3 rollouts hit the 12-turn ceiling mid-function_call, never answering,
+      # while generation is 150-250 tok/turn. 24 x 4096 ~= 111,604 <= the 131,072 packer bin.
+      max_steps: 70
+      # Rollout truncation (.tmp/rl_truncation_thresholds.md). Wall clock is the PRIMARY
+      # reaper defence; repetition is the cheap early complement. Aborted rows are clamped.
+      repetition_abort_threshold: 7
+      repetition_abort_mode: consecutive
+      # 2026-10-14: 1200 -> 10800 (3h) FAILED: rollouts held sandbox sessions ~9x longer,
+      # the per-node nginx sidecar ran out, and 63k+ 'All connection attempts failed' errors
+      # killed every rollout (job 20199873 FAILED, 0 steps). Settled on 2400s.
+      # 2026-10-14 v4: BACK TO 1200. 2400 gave 0 aborts, but reaping was also the session-cleanup
+      # path: sessions leaked, 464k connection errors, v3 val170 collapsed 0.5074 -> 0.1206.
+      wall_clock_abort_seconds: 1200.0
+      resources_server:
+        type: resources_servers
+        name: ns_tools
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+        # `type` and `license` are validated against Gym enums (nemo_gym/config_types.py).
+        # An invalid value makes the whole server an "almost-server": Gym prints a warning,
+        # does NOT start the server, and then raises AlmostServerError (job 3937512).
+        #   type    must be one of: train, validation, example        ("test" is NOT valid)
+        #   license must be one of: Apache 2.0, MIT, CC BY 4.0, CC BY-SA 4.0, CC BY-NC 3.0,
+        #           NVIDIA Internal Use Only Do Not Distribute, NVIDIA Evaluation Dataset
+        #           License Agreement, TBD, GNU GPL v3.0            ("NVIDIA internal" is NOT)
+        - name: dabstep_rl_train
+          type: train
+          license: NVIDIA Internal Use Only, Do Not Distribute
+          jsonl_fpath: environments/dabstep_rl/data/train.jsonl
+        - name: dabstep_rl_val
+          type: validation
+          license: NVIDIA Internal Use Only, Do Not Distribute
+          jsonl_fpath: environments/dabstep_rl/data/val.jsonl
+        - name: dabstep_rl_smoke
+          type: example
+          license: NVIDIA Internal Use Only, Do Not Distribute
+          jsonl_fpath: environments/dabstep_rl/data/smoke.jsonl
+
+dabstep_rl_environment_server:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server:
+        type: responses_api_agents
+        name: dabstep_rl_simple_agent

@@ -1,0 +1,10 @@
+dabstep_rl:
+  resources_servers:
+    dabstep_rl:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: >-
+        DABStep GRPO reward. Strict symbolic/numeric match (verbatim port of the real
+        NeMo-Skills DABStep evaluator) against consensus pseudo-labels.
+      value: RL reward signal for DABStep worlds + real corpora
