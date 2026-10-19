@@ -290,6 +290,7 @@ class SimpleResourcesServer(BaseResourcesServer, AggregateMetricsMixin, SimpleSe
     checkpoint_session_starts: ClassVar[tuple[str, ...]] = ("/seed_session",)
     _checkpoint: Optional[ResourcesParticipant] = PrivateAttr(default=None)
     _mcp_token_serializer: Any = PrivateAttr(default=None)
+    routes_sessions_to_owner = True
 
     def setup_webserver(self) -> FastAPI:
         app = FastAPI()
