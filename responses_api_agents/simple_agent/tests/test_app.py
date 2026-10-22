@@ -1519,3 +1519,98 @@ class TestApp:
         assert post_call_kwargs[0]["server_name"] == "my resources server"
         assert post_call_kwargs[1]["server_name"] == "simple_agent"
         assert post_call_kwargs[1]["cookies"] == {"session": "seeded"}
+
+
+class TestTokenBudgetAbort:
+    """LOCAL PATCH: token_budget_abort_tokens stops a tool-calling episode at the budget."""
+
+    @staticmethod
+    def _agent(budget):
+        config = SimpleAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="simple",
+            model_server=ModelServerRef(type="responses_api_models", name="model"),
+            resources_server=ResourcesServerRef(type="resources_servers", name="resources"),
+            max_steps=5,
+            token_budget_abort_tokens=budget,
+        )
+        server_client = MagicMock(spec=ServerClient)
+        server_client.global_config_dict = {"observability_enabled": False}
+        return SimpleAgent(config=config, server_client=server_client), server_client
+
+    @staticmethod
+    def _payload(i, input_tokens, output_tokens, *, final=False, token_ids=None):
+        if final:
+            item = {
+                "id": f"msg_{i}",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "done", "annotations": []}],
+            }
+        else:
+            # Invalid JSON arguments: the agent answers with an error and makes no HTTP tool call.
+            item = {"type": "function_call", "id": f"fc_{i}", "call_id": f"call_{i}", "name": "t", "arguments": "{bad"}
+        if token_ids is not None:
+            item |= {
+                "prompt_token_ids": list(range(token_ids[0])),
+                "generation_token_ids": list(range(token_ids[1])),
+                "generation_log_probs": [-0.1] * token_ids[1],
+            }
+        return {
+            "id": f"resp_{i}",
+            "created_at": 1.0,
+            "model": "model",
+            "object": "response",
+            "output": [item],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": {
+                "input_tokens": input_tokens,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": output_tokens,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": input_tokens + output_tokens,
+            },
+        }
+
+    async def _run(self, budget, payloads):
+        server, server_client = self._agent(budget)
+        server_client.post = AsyncMock(side_effect=[_mock_response(p) for p in payloads])
+        response, _, _, _, record = await server._create_episode(
+            NeMoGymResponseCreateParamsNonStreaming(input="question"), model_url_path="/v1/responses"
+        )
+        return response, record, server_client.post.await_count
+
+    async def test_stops_at_budget_before_running_tools(self) -> None:
+        payloads = [self._payload(i, 10 * (i + 1), 5) for i in range(5)]  # contexts 15, 25, 35...
+        response, record, calls = await self._run(25, payloads)
+        assert calls == 2
+        assert record["reason"] == "token_budget"
+        assert record["context_tokens"] == 25
+        assert record["call_index"] == 1  # only the first turn's tool ran
+        assert [o.type for o in response.output] == ["function_call", "function_call_output", "function_call"]
+
+    async def test_disabled_by_default_runs_to_max_steps(self) -> None:
+        payloads = [self._payload(i, 10_000 * (i + 1), 5) for i in range(5)]
+        _, record, calls = await self._run(None, payloads)
+        assert calls == 5
+        assert record is None
+
+    async def test_final_answer_over_budget_is_not_an_abort(self) -> None:
+        payloads = [self._payload(0, 10, 5), self._payload(1, 100, 50, final=True)]
+        _, record, calls = await self._run(25, payloads)
+        assert calls == 2
+        assert record is None
+
+    async def test_token_ids_take_precedence_over_usage(self) -> None:
+        # usage says 2000 but the trained token IDs say 20 + 5 = 25.
+        payloads = [self._payload(i, 1000, 1000, token_ids=(20, 5)) for i in range(5)]
+        _, record, calls = await self._run(26, payloads)
+        assert record is None and calls == 5
+        _, record, calls = await self._run(25, payloads)
+        assert calls == 1
+        assert record["context_tokens"] == 25

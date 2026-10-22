@@ -74,7 +74,9 @@ dabstep_rl_simple_agent:
       entrypoint: app.py
       # S3.22: 39.8% of v3 rollouts hit the 12-turn ceiling mid-function_call, never answering,
       # while generation is 150-250 tok/turn. 24 x 4096 ~= 111,604 <= the 131,072 packer bin.
-      max_steps: 70
+      # v5: turns are the MAIN limit (load-independent). Finished rollouts: <=25 turns 84-99% correct,
+      # 30-35 ~55%, >50 11% (2026-10-21 SC smoke data).
+      max_steps: 30
       # Rollout truncation (.tmp/rl_truncation_thresholds.md). Wall clock is the PRIMARY
       # reaper defence; repetition is the cheap early complement. Aborted rows are clamped.
       repetition_abort_threshold: 7
@@ -84,7 +86,11 @@ dabstep_rl_simple_agent:
       # killed every rollout (job 20199873 FAILED, 0 steps). Settled on 2400s.
       # 2026-10-14 v4: BACK TO 1200. 2400 gave 0 aborts, but reaping was also the session-cleanup
       # path: sessions leaked, 464k connection errors, v3 val170 collapsed 0.5074 -> 0.1206.
-      wall_clock_abort_seconds: 1200.0
+      # v5: hang guard only, so the 30-turn cap binds. 900 s cut at ~25 turns and 1200 s at ~28-30
+      # turns once 768 rollouts were in flight (~38-42 s/call).
+      wall_clock_abort_seconds: 1800.0
+      # v5: stop once the context reaches the 32K training bin (32,704 usable); clamp + penalty handle the rest.
+      token_budget_abort_tokens: 32000
       resources_server:
         type: resources_servers
         name: ns_tools

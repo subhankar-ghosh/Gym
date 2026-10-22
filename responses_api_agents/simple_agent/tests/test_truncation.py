@@ -25,7 +25,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from truncation import (  # noqa: E402
     BACKSTOP,
     REPETITION,
+    TOKEN_BUDGET,
     TruncationMonitor,
+    context_tokens,
     tool_call_fingerprint,
 )
 
@@ -165,6 +167,53 @@ class TestBackstop:
         assert m.record["reason"] == REPETITION
 
 
+class TestTokenBudget:
+    def test_context_tokens_prefers_token_ids(self):
+        output = [
+            {"type": "reasoning"},
+            {"type": "function_call", "prompt_token_ids": [1] * 10, "generation_token_ids": [2] * 5},
+        ]
+        assert context_tokens(output, {"input_tokens": 999, "output_tokens": 999}) == 15
+
+    def test_context_tokens_falls_back_to_usage(self):
+        class Usage:
+            input_tokens, output_tokens = 100, 20
+
+        assert context_tokens([{"type": "message"}], Usage()) == 120
+        assert context_tokens([], {"input_tokens": 7, "output_tokens": 3}) == 10
+        assert context_tokens([{"type": "message"}], None) is None
+
+    @pytest.mark.parametrize("tokens,fires", [(99, False), (100, True), (150, True)])
+    def test_fires_at_budget(self, tokens, fires):
+        m = TruncationMonitor(token_budget=100, clock=FakeClock())
+        m.observe("python", "{}")
+        record = m.check_context(tokens)
+        assert (record is not None) == fires
+        if fires:
+            assert record["reason"] == TOKEN_BUDGET
+            assert record["context_tokens"] == tokens
+            assert record["call_index"] == 1
+            assert record["mode"] is None
+
+    def test_disabled_or_unmeasured_never_fires(self):
+        assert TruncationMonitor(clock=FakeClock()).check_context(10**9) is None
+        assert TruncationMonitor(token_budget=10, clock=FakeClock()).check_context(None) is None
+
+    def test_default_monitor_has_no_budget(self):
+        # Positional construction, as before the patch, leaves the budget off.
+        assert TruncationMonitor(5, "consecutive", None, FakeClock()).token_budget is None
+
+    def test_earlier_record_wins(self):
+        m = TruncationMonitor(2, token_budget=10, clock=FakeClock())
+        m.observe("python", "{}")
+        m.observe("python", "{}")
+        assert m.check_context(10**6)["reason"] == REPETITION
+
+    def test_rejects_bad_budget(self):
+        with pytest.raises(ValueError):
+            TruncationMonitor(token_budget=0)
+
+
 class TestAppWiring:
     """Guards the call sites in app.py; the agent itself needs nemo_gym to import."""
 
@@ -188,5 +237,6 @@ class TestAppWiring:
             "repetition_abort_threshold",
             "repetition_abort_mode",
             "wall_clock_abort_seconds",
+            "token_budget_abort_tokens",
         ):
             assert f"self.config.{key}" in src

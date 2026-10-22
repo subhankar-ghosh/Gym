@@ -59,7 +59,7 @@ from nemo_gym.rollout_observability import (
 from nemo_gym.server_utils import get_response_json, is_nemo_gym_fastapi_entrypoint, raise_for_status
 from nemo_gym.server_utils import request as http_request
 from nemo_gym.tool_access import DirectHTTPToolAccess, MCPToolAccess
-from responses_api_agents.simple_agent.truncation import TruncationMonitor
+from responses_api_agents.simple_agent.truncation import TruncationMonitor, context_tokens
 
 
 LOG = logging.getLogger(__name__)
@@ -92,13 +92,17 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     repetition_abort_threshold: int | None = None
     repetition_abort_mode: str = "consecutive"
     wall_clock_abort_seconds: float | None = None
+    # Stop once one model call's prompt + generation reaches this many tokens (e.g. the
+    # trainer's max_total_sequence_length). Recorded as _ng_truncation reason "token_budget".
+    token_budget_abort_tokens: int | None = None
 
     def model_post_init(self, context: Any, /) -> None:
         super().model_post_init(context)
         # Print once at startup so a missing limit is visible in the first log lines.
         print(
             f"[simple_agent] truncation: repetition_abort_threshold={self.repetition_abort_threshold} "
-            f"({self.repetition_abort_mode}), wall_clock_abort_seconds={self.wall_clock_abort_seconds}",
+            f"({self.repetition_abort_mode}), wall_clock_abort_seconds={self.wall_clock_abort_seconds}, "
+            f"token_budget_abort_tokens={self.token_budget_abort_tokens}",
             flush=True,
         )
 
@@ -179,6 +183,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             repetition_threshold=self.config.repetition_abort_threshold,
             repetition_mode=self.config.repetition_abort_mode,
             wall_clock_seconds=self.config.wall_clock_abort_seconds,
+            token_budget=self.config.token_budget_abort_tokens,
         )
 
         while True:
@@ -235,6 +240,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     )
                 )
 
+            # Per-call size, read before usage is accumulated and cleared.
+            call_tokens = context_tokens(model_response_json.get("output"), model_response.usage)
             usage = accumulate_response_usage(usage, model_response.usage)
             model_response.usage = None
 
@@ -272,6 +279,11 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         rollout_id,
                         step,
                     )
+                break
+
+            # A final answer ends normally above; a tool-calling turn at the budget stops here.
+            if monitor.check_context(call_tokens) is not None:
+                invocation_status = "incomplete"
                 break
 
             if not execute_tools:

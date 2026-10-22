@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""LOCAL PATCH: rollout truncation rules (repetition + wall-clock backstop).
+"""LOCAL PATCH: rollout truncation rules (repetition, wall-clock backstop, token budget).
 
 Pure logic, no I/O and no nemo_gym imports, so it is unit-testable standalone.
 """
@@ -24,6 +24,7 @@ from typing import Any, Callable, Optional
 
 REPETITION = "repetition"
 BACKSTOP = "backstop"
+TOKEN_BUDGET = "token_budget"
 MODES = ("consecutive", "anywhere")
 
 
@@ -52,6 +53,22 @@ def tool_call_fingerprint(tool_name: str, arguments: Any) -> str:
     return f"{tool_name}\x00{args}"
 
 
+def context_tokens(output: Any, usage: Any) -> Optional[int]:
+    """Tokens of one model call as the policy saw them: prompt + generation.
+
+    Prefers the call's token IDs (exactly what NeMo-RL trains on); falls back to the
+    call's usage (vLLM prompt_tokens + completion_tokens). None when neither is present.
+    """
+    for item in reversed(output or []):
+        if isinstance(item, dict) and item.get("prompt_token_ids") is not None:
+            return len(item["prompt_token_ids"]) + len(item.get("generation_token_ids") or [])
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+    return int(usage.input_tokens or 0) + int(usage.output_tokens or 0)
+
+
 class TruncationMonitor:
     """Tracks one rollout and decides whether to abort it early.
 
@@ -66,14 +83,18 @@ class TruncationMonitor:
         repetition_mode: str = "consecutive",
         wall_clock_seconds: Optional[float] = None,
         clock: Callable[[], float] = perf_counter,
+        token_budget: Optional[int] = None,
     ) -> None:
         if repetition_mode not in MODES:
             raise ValueError(f"repetition_mode must be one of {MODES}, got {repetition_mode!r}")
         if repetition_threshold is not None and repetition_threshold < 2:
             raise ValueError("repetition_threshold must be >= 2 or None to disable")
+        if token_budget is not None and token_budget < 1:
+            raise ValueError("token_budget must be >= 1 or None to disable")
         self.repetition_threshold = repetition_threshold
         self.repetition_mode = repetition_mode
         self.wall_clock_seconds = wall_clock_seconds
+        self.token_budget = token_budget
         self._clock = clock
         self._start = clock()
         self._counts: Counter = Counter()
@@ -106,6 +127,18 @@ class TruncationMonitor:
             return self.record
         if self.elapsed >= self.wall_clock_seconds:
             self.record = self._build(BACKSTOP)
+        return self.record
+
+    def check_context(self, tokens: Optional[int]) -> Optional[dict]:
+        """Returns the abort record once one call's context reaches the token budget.
+
+        At the budget any further turn would exceed it, so the agent stops before tools run.
+        """
+        if self.record is not None or self.token_budget is None or tokens is None:
+            return self.record
+        if tokens >= self.token_budget:
+            self.record = self._build(TOKEN_BUDGET)
+            self.record["context_tokens"] = tokens
         return self.record
 
     def _build(self, reason: str, repeat_count: int = 0) -> dict:
