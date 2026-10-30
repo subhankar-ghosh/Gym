@@ -39,6 +39,7 @@ from nemo_gym.base_responses_api_agent import (
 )
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
 from nemo_gym.openai_utils import (
+    TOKEN_METADATA_FIELDS,
     NeMoGymEasyInputMessage,
     NeMoGymFunctionCallOutput,
     NeMoGymResponse,
@@ -95,6 +96,8 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     # Stop once one model call's prompt + generation reaches this many tokens (e.g. the
     # trainer's max_total_sequence_length). Recorded as _ng_truncation reason "token_budget".
     token_budget_abort_tokens: int | None = None
+    # Send token ids only on the latest input item that has them (NeMo-RL reads only that one).
+    send_latest_token_ids_only: bool = False
 
     def model_post_init(self, context: Any, /) -> None:
         super().model_post_init(context)
@@ -105,6 +108,18 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
             f"token_budget_abort_tokens={self.token_budget_abort_tokens}",
             flush=True,
         )
+
+
+def _model_request_payload(body: NeMoGymResponseCreateParamsNonStreaming, latest_only: bool) -> Any:
+    if not latest_only:
+        return body
+    # Fresh dicts only: the input items are shared with new_outputs (the training data).
+    payload = body.model_dump(exclude_unset=True)
+    items = payload["input"]
+    with_ids = [i for i, item in enumerate(items) if isinstance(item, dict) and "prompt_token_ids" in item]
+    for i in with_ids[:-1]:
+        items[i] = {k: v for k, v in items[i].items() if k not in TOKEN_METADATA_FIELDS}
+    return payload
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -195,7 +210,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             model_response = await self.server_client.post(
                 server_name=self.config.model_server.name,
                 url_path=model_url_path,
-                json=new_body,
+                json=_model_request_payload(new_body, self.config.send_latest_token_ids_only),
                 cookies=model_server_cookies,
             )
             # We raise for status here since we expect model calls to always work.

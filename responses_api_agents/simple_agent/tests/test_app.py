@@ -19,6 +19,7 @@ import orjson
 import pytest
 from fastapi import HTTPException, Response
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 from pytest import MonkeyPatch
 
 from nemo_gym.base_responses_api_agent import AgentCloseSessionRequest, AgentSeedSessionRequest
@@ -1614,3 +1615,61 @@ class TestTokenBudgetAbort:
         _, record, calls = await self._run(25, payloads)
         assert calls == 1
         assert record["context_tokens"] == 25
+
+
+class TestSendLatestTokenIdsOnly:
+    """LOCAL PATCH: send_latest_token_ids_only strips earlier token bundles from model requests."""
+
+    _FIELDS = ("prompt_token_ids", "generation_token_ids", "generation_log_probs", "routed_experts")
+
+    async def _run(self, flag):
+        server, server_client = TestTokenBudgetAbort._agent(None)
+        server.config.send_latest_token_ids_only = flag
+        payloads = [TestTokenBudgetAbort._payload(i, 10, 5, token_ids=(3 + i, 2), final=i == 2) for i in range(3)]
+        for p in payloads:
+            p["output"][0]["routed_experts"] = [[[1]]]
+        sent = []
+
+        async def post(**kwargs):
+            # Serialize at call time, as the real client does.
+            sent.append(orjson.loads(_serialize(kwargs["json"])))
+            return _mock_response(payloads[len(sent) - 1])
+
+        server_client.post = AsyncMock(side_effect=post)
+        response, *_ = await server._create_episode(
+            NeMoGymResponseCreateParamsNonStreaming(input="question"), model_url_path="/v1/responses"
+        )
+        return sent, response
+
+    def _bundled(self, request):
+        return [i for i, item in enumerate(request["input"]) if any(f in item for f in self._FIELDS)]
+
+    async def test_flag_off_request_unchanged(self) -> None:
+        sent, _ = await self._run(False)
+        assert [len(self._bundled(r)) for r in sent] == [0, 1, 2]
+        assert sent[2]["input"][1]["prompt_token_ids"] == [0, 1, 2]
+
+    async def test_flag_on_keeps_only_latest_bundle(self) -> None:
+        off, _ = await self._run(False)
+        on, _ = await self._run(True)
+        for r_off, r_on in zip(off, on):
+            bundled = self._bundled(r_off)
+            assert self._bundled(r_on) == bundled[-1:]
+            stripped = [{k: v for k, v in it.items() if k not in self._FIELDS} for it in r_off["input"]]
+            if bundled:
+                stripped[bundled[-1]] = r_off["input"][bundled[-1]]
+            assert r_on["input"] == stripped
+            assert {k: v for k, v in r_on.items() if k != "input"} == {k: v for k, v in r_off.items() if k != "input"}
+
+    async def test_flag_on_does_not_touch_stored_outputs(self) -> None:
+        _, response = await self._run(True)
+        calls = [o for o in response.output if o.type != "function_call_output"]
+        assert [o.type for o in calls] == ["function_call", "function_call", "message"]
+        for i, call_item in enumerate(calls):
+            assert call_item.prompt_token_ids == list(range(3 + i))
+            assert call_item.generation_log_probs == [-0.1, -0.1]
+            assert call_item.routed_experts == [[[1]]]
+
+
+def _serialize(obj):
+    return orjson.dumps(obj.model_dump(exclude_unset=True) if isinstance(obj, BaseModel) else obj)

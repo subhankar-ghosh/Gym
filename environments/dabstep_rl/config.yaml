@@ -91,6 +91,8 @@ dabstep_rl_simple_agent:
       wall_clock_abort_seconds: 1800.0
       # v5: stop once the context reaches the 32K training bin (32,704 usable); clamp + penalty handle the rest.
       token_budget_abort_tokens: 32000
+      # v6: drop token bundles from earlier turns (server reads only the latest); request O(n) not O(n^2).
+      send_latest_token_ids_only: true
       resources_server:
         type: resources_servers
         name: ns_tools
